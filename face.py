@@ -1,8 +1,145 @@
 
 import numpy as np
 import networkx as nx
-from sklearn.neighbors import NearestNeighbors
+from sklearn.neighbors import KernelDensity, NearestNeighbors
 import pandas as pd
+
+import numpy as np
+import networkx as nx
+from sklearn.neighbors import KernelDensity, NearestNeighbors
+
+class FACE_KDE:
+    def __init__(self, model, data, labels, epsilon=0.6, tp=0.5, td=0.01, constraints=None):
+        """
+        Implementação baseada no Algoritmo 1 (KDE).
+        """
+        self.model = model
+        self.data = np.array(data)
+        self.labels = np.array(labels)
+        self.epsilon = epsilon
+        self.constraints = constraints
+        self.tp = tp  # Threshold de probabilidade
+        self.td = td  # Threshold de densidade
+        
+        # 1. Filtro de Fidelidade: Usamos apenas onde o modelo acerta
+        # Isso garante que o grafo seja construído sobre 'casos reais'
+        preds = self.model.predict(self.data)
+        valid_idx = np.where(preds == self.labels)[0]
+        self.valid_data = self.data[valid_idx]
+        self.valid_labels = self.labels[valid_idx]
+        
+        # 2. Estimador de Densidade (p_hat) treinado nos dados válidos
+        # O Algoritmo 1 exige um estimador de densidade (p_hat)
+        self.kde = KernelDensity(kernel='gaussian', bandwidth=0.1).fit(self.valid_data)
+        
+        # 3. Construção do Grafo (Linhas 1-7 do Algoritmo 1)
+        self.graph = self._build_graph_kde()
+
+    def _get_density(self, x):
+        """Retorna a densidade estimada p_hat(x)."""
+        return np.exp(self.kde.score_samples(x.reshape(1, -1)))[0]
+
+    def _build_graph_kde(self):
+        """Constrói o grafo respeitando epsilon e restrições."""
+        G = nx.DiGraph() if self.constraints else nx.Graph()
+        
+        # Buscamos vizinhos dentro do raio epsilon
+        nn = NearestNeighbors(radius=self.epsilon)
+        nn.fit(self.valid_data)
+        adj_matrix = nn.radius_neighbors_graph(self.valid_data, self.epsilon, mode='distance')
+        
+        rows, cols = adj_matrix.nonzero()
+        for i, j in zip(rows, cols):
+            if i >= j and not isinstance(G, nx.DiGraph): continue
+            
+            xi, xj = self.valid_data[i], self.valid_data[j]
+            dist = adj_matrix[i, j]
+            
+            # Linha 2: d(xi, xj) <= epsilon e c(xi, xj) é True
+            if self._check_constraints(xi, xj):
+                mid_point = (xi + xj) / 2
+                density_mid = self._get_density(mid_point)
+                
+                # Linha 7: w_ij = d(xi, xj) / p_hat(mid)
+                weight = dist / (density_mid + 1e-9)
+                G.add_edge(i, j, weight=weight)
+        return G
+
+    def _check_constraints(self, start, end):
+        if self.constraints is None: return True
+        for idx, direction in self.constraints.items():
+            if direction == "increasing" and end[idx] < start[idx]: return False
+            if direction == "decreasing" and end[idx] > start[idx]: return False
+        return True
+
+    def explain(self, query_instance, target_class=0):
+        """
+        Busca contrafatual seguindo o Algoritmo 1 de forma robusta.
+        """
+        # 1. Validação de Alvos Candidatos (I_CT)
+        # Filtro: Probabilidade >= tp E Densidade >= td
+        probs = self.model.predict_proba(self.valid_data)[:, target_class]
+        densities = np.exp(self.kde.score_samples(self.valid_data))
+        
+        i_ct = np.where((probs >= self.tp) & (densities >= self.td))[0]
+        
+        if len(i_ct) == 0:
+            print(f"DEBUG: Nenhum alvo encontrado com P >= {self.tp} e Densidade >= {self.td:.2e}")
+            return None
+
+        # 2. Preparação do Grafo Temporário
+        temp_graph = self.graph.copy()
+        q_id = "QUERY"
+        query_instance_flat = query_instance.flatten()
+        
+        # 3. Conexão da Query ao Grafo
+        nn = NearestNeighbors(radius=self.epsilon)
+        nn.fit(self.valid_data)
+        dists, idxs = nn.radius_neighbors(query_instance_flat.reshape(1, -1))
+        
+        connected_edges = 0
+        for d, idx in zip(dists[0], idxs[0]):
+            # Validação de restrições (c(xi, xj) is True)
+            if self._check_constraints(query_instance_flat, self.valid_data[idx]):
+                # Cálculo do peso w_ij usando densidade do ponto médio
+                mid = (query_instance_flat + self.valid_data[idx]) / 2
+                density_mid = self._get_density(mid)
+                
+                # Peso = d(xi, xj) / p_hat(mid)
+                w = d / (density_mid + 1e-9)
+                temp_graph.add_node(q_id) # Garante que o nó existe
+                temp_graph.add_edge(q_id, idx, weight=w)
+                connected_edges += 1
+
+        # 4. Verificação Crítica de Conectividade Inicial
+        if q_id not in temp_graph:
+            print(f"DEBUG: Query isolada. Nenhum vizinho em epsilon={self.epsilon} respeita as restrições.")
+            return None
+
+        # 5. Busca do Caminho Mais Curto (Dijkstra Otimizado)
+        # Em vez de um loop, calculamos todas as distâncias a partir da QUERY uma única vez
+        try:
+            lengths, paths = nx.single_source_dijkstra(temp_graph, q_id, weight='weight')
+            
+            best_target = None
+            min_weight = float('inf')
+            
+            # Filtramos apenas os caminhos que levam a um índice em I_CT
+            for target_idx in i_ct:
+                if target_idx in lengths and lengths[target_idx] < min_weight:
+                    min_weight = lengths[target_idx]
+                    best_target = target_idx
+            
+            if best_target is not None:
+                path_nodes = paths[best_target]
+                # Retorna o array de coordenadas: [Query, Passo1, ..., Alvo]
+                return np.array([query_instance_flat] + [self.valid_data[i] for i in path_nodes[1:]])
+                
+        except Exception as e:
+            print(f"DEBUG: Erro durante o cálculo do caminho: {e}")
+            
+        print("DEBUG: Nenhum caminho conectando a Query aos candidatos do I_CT.")
+        return None
 
 class FACE:
     def __init__(self, model, training_data, target_labels, n_neighbors=20, constraints=None, mode='endpoint'):
